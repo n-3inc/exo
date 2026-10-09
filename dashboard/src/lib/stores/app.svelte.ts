@@ -1723,8 +1723,7 @@ class AppStore {
           model: modelToUse,
           messages: apiMessages,
           stream: true,
-          logprobs: true,
-          top_logprobs: 5,
+          logprobs: false,
         }),
       });
 
@@ -1946,8 +1945,7 @@ class AppStore {
           model: modelToUse,
           messages: apiMessages,
           stream: true,
-          logprobs: true,
-          top_logprobs: 5,
+          logprobs: false,
         }),
       });
 
@@ -2522,8 +2520,7 @@ class AppStore {
           messages: apiMessages,
           temperature: 0.7,
           stream: true,
-          logprobs: true,
-          top_logprobs: 5,
+          logprobs: false,
           ...(enableThinking != null && {
             enable_thinking: enableThinking,
           }),
