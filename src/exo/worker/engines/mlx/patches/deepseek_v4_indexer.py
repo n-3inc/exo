@@ -98,25 +98,23 @@ def _patched_call(
     return _score_and_select(self, x, qr, idx_kv, offset)
 
 
-def _sliced_relu_weighted_scores(
-    q: mx.array, idx_kv: mx.array, per_head_weights: mx.array
+def _sliced_top_rows(
+    q: mx.array, idx_kv: mx.array, per_head_weights: mx.array, k: int
 ) -> mx.array:
-    """``relu_weighted_sum`` of the ``[B, S, n_heads, pool]`` score tensor,
-    which grows with the context (7 GB for a 4096-token chunk at 54K tokens).
+    """Top-``k`` pool rows per query from ``relu_weighted_sum`` of the
+    ``[B, S, n_heads, pool]`` score tensor, which grows with the context (7 GB
+    for a 4096-token chunk at 54K tokens).
 
-    Past ``_SCORE_BYTES_PER_SLICE`` it is scored a few query rows at a time;
-    rows are independent, so the result is bit-identical. Each slice is
-    evaluated before the next is built: buffers are only recycled once their
-    command buffer completes, so lazily queued slices would all be resident
-    at once.
+    Queries are scored a slice at a time, at most ``_SCORE_BYTES_PER_SLICE``
+    of scores each, and each slice's top-k is taken before the next slice is
+    built, so neither the score tensor nor the ``[S, pool]`` reduction and its
+    argpartition indices (3 GB at 350K tokens) are ever whole. Rows are
+    independent, so the result is bit-identical. Each slice is evaluated
+    before the next: buffers are only recycled once their command buffer
+    completes, so lazily queued slices would all be resident at once.
     """
     batch, sequence, heads, _ = q.shape
     rows = max(1, _SCORE_BYTES_PER_SLICE // (batch * heads * idx_kv.shape[1] * 2))
-    if rows >= sequence:
-        return relu_weighted_sum(
-            mx.einsum("bshd,btd->bsht", q, idx_kv),  # pyright: ignore[reportUnknownMemberType]
-            per_head_weights,
-        )
     slices: list[mx.array] = []
     for start in range(0, sequence, rows):
         scores = relu_weighted_sum(
@@ -125,9 +123,11 @@ def _sliced_relu_weighted_scores(
             ),
             per_head_weights[:, start : start + rows],
         )
-        mx.eval(scores)
-        slices.append(scores)
-    return mx.concatenate(slices, axis=1)
+        top = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
+        if rows < sequence:
+            mx.eval(top)
+        slices.append(top)
+    return slices[0] if len(slices) == 1 else mx.concatenate(slices, axis=1)
 
 
 def _score_and_select(
@@ -149,15 +149,14 @@ def _score_and_select(
         self.weights_proj(x), self.softmax_scale * math.pow(self.n_heads, -0.5)
     )
     q = q.astype(idx_kv.dtype)
-    if fused:
-        score = _sliced_relu_weighted_scores(q, idx_kv, per_head_weights)
-    else:
-        score = mx.einsum(  # pyright: ignore[reportUnknownMemberType]
-            "bshd,btd->bsht", q, idx_kv
-        )
-        score = mx.maximum(score, 0)
-        score = mx.matmul(per_head_weights[:, :, None, :], score).squeeze(2)
     k = min(self.index_topk, idx_kv.shape[1])
+    if fused:
+        return _sliced_top_rows(q, idx_kv, per_head_weights, k)
+    score = mx.einsum(  # pyright: ignore[reportUnknownMemberType]
+        "bshd,btd->bsht", q, idx_kv
+    )
+    score = mx.maximum(score, 0)
+    score = mx.matmul(per_head_weights[:, :, None, :], score).squeeze(2)
     return mx.argpartition(-score, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
 
 

@@ -148,7 +148,7 @@ def test_indexer_scores_query_slices_identically(
         indexer_patch, "_SCORE_BYTES_PER_SLICE", indexer.n_heads * 90 * 2 * 16
     )
     sliced = indexer_patch._score_and_select(indexer, x, qr, idx_kv, 300, fused=True)
-    assert mx.array_equal(mx.sort(whole, -1), mx.sort(sliced, -1)).item()
+    assert mx.array_equal(whole, sliced).item()
 
 
 def _chunked_attention(attention: dv4.V4Attention, x: mx.array, chunk: int) -> mx.array:
