@@ -30,17 +30,15 @@ if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import MediaRegion
 
 
-# Fraction of device memory above which LRU eviction kicks in.
-# Smaller machines need more aggressive eviction.
+# Fraction of device memory above which LRU eviction kicks in: when less than
+# 4GB is left. A large model sharded over a cluster leaves each node above a
+# fixed fraction such as 80% at all times (DeepSeek V4 Flash on 4x 64GB uses
+# ~87% with nothing cached), so every entry was evicted as soon as it was
+# stored and two agent sessions re-prefilled their whole context on every turn.
+# PREFIX_CACHE_BYTE_LIMIT bounds what the entries themselves hold.
 def _default_memory_threshold() -> float:
-    total_gb = Memory.from_bytes(psutil.virtual_memory().total).in_gb
-    if total_gb >= 128:
-        return 0.85
-    if total_gb >= 64:
-        return 0.80
-    if total_gb >= 32:
-        return 0.75
-    return 0.70
+    total = Memory.from_bytes(psutil.virtual_memory().total)
+    return min(0.94, 1 - Memory.from_gb(4).in_bytes / total.in_bytes)
 
 
 _MEMORY_THRESHOLD = float(

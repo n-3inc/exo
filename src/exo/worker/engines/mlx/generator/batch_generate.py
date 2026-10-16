@@ -31,6 +31,7 @@ from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
     encode_prompt,
     make_kv_cache,
+    prefix_entry_nbytes,
 )
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
@@ -285,13 +286,23 @@ class ExoBatchGenerator:
 
         if self.kv_prefix_cache is not None:
             snapshot_count = sum(len(s or []) for s in self.kv_prefix_cache._snapshots)  # pyright: ignore[reportPrivateUsage]
+            prefix_bytes = sum(
+                prefix_entry_nbytes(c, s)
+                for c, s in zip(
+                    self.kv_prefix_cache.caches,
+                    self.kv_prefix_cache._snapshots,  # pyright: ignore[reportPrivateUsage]
+                    strict=True,
+                )
+            )
         else:
             snapshot_count = 0
+            prefix_bytes = 0
         logger.info(
             f"Memory after prefill: active={mx.get_active_memory() / 1e9:.2f}GB "
             f"cache={mx.get_cache_memory() / 1e9:.2f}GB peak={mx.get_peak_memory() / 1e9:.2f}GB "
             f"prefix_entries={len(self.kv_prefix_cache.caches) if self.kv_prefix_cache else 0} "
-            f"snapshots={snapshot_count} new_snapshots={len(cache_snapshots)}"
+            f"snapshots={snapshot_count} new_snapshots={len(cache_snapshots)} "
+            f"prefix_bytes={prefix_bytes / 1e9:.2f}GB"
         )
         mx.reset_peak_memory()
 
