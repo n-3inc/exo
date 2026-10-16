@@ -129,3 +129,23 @@ def test_only_a_continuation_replaces_an_entry() -> None:
     assert kv_prefix_cache.continues_entry(0, 4435)
     # Another session that only shares the 4096-token system prompt.
     assert not kv_prefix_cache.continues_entry(0, 4096)
+
+
+def test_restores_from_the_entry_that_restores_most() -> None:
+    kv_prefix_cache = KVPrefixCache(None)
+    session = mx.arange(6000, dtype=mx.int32)
+    with patch(
+        "exo.worker.engines.mlx.cache.get_memory_used_percentage", return_value=0.0
+    ):
+        # An earlier run shares 5800 tokens but only has a snapshot at 4096
+        # before them; this session's own entry ends at 5500.
+        stale = mx.concatenate([session[:5800], mx.full((2200,), -1, mx.int32)])
+        kv_prefix_cache.add_kv_cache(stale, [ArraysCache(1)], _snapshots(4096, 7999))
+        kv_prefix_cache.add_kv_cache(
+            session[:5500], [ArraysCache(1)], _snapshots(4096, 5498)
+        )
+    query = session
+    with patch("exo.worker.engines.mlx.cache.make_kv_cache", return_value=[]):
+        _, remaining, index, _ = kv_prefix_cache.get_kv_cache(None, query)  # pyright: ignore[reportArgumentType]
+    assert index == 1
+    assert len(remaining) == len(query) - 5498
