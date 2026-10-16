@@ -47,6 +47,28 @@ _MEMORY_THRESHOLD = float(
     os.environ.get("EXO_MEMORY_THRESHOLD", _default_memory_threshold())
 )
 
+# Upper bound on the memory held by stored prefix-cache entries. On macOS
+# psutil counts reclaimable file cache as available, so the percentage above
+# can read 64% while the GPU is short of memory, and entries from every agent
+# session piled up until prefill stalled for minutes.
+PREFIX_CACHE_BYTE_LIMIT = Memory.from_gb(4)
+
+
+def _cache_entry_nbytes(c: object) -> int:
+    try:
+        return int(c.nbytes)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]
+    except (AttributeError, NotImplementedError):
+        return 0
+
+
+def prefix_entry_nbytes(
+    cache: KVCacheType, snapshots: "list[CacheSnapshot] | None"
+) -> int:
+    total = sum(_cache_entry_nbytes(c) for c in cache)
+    for snap in snapshots or []:
+        total += sum(_cache_entry_nbytes(s) for s in snap.states if s is not None)
+    return total
+
 
 class CacheSnapshot:
     """Snapshot of states at a known token position."""
@@ -405,6 +427,7 @@ class KVPrefixCache:
         self._access_counter += 1
         self._last_used[index] = self._access_counter
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
+        self._evict_if_needed()
 
     def _get_snapshot(
         self, entry_index: int, target_token_count: int
@@ -550,9 +573,10 @@ class KVPrefixCache:
 
         evicted_any = False
         # Evict LRU entries until below threshold
-        while (
-            len(self.caches) > 0
-            and self.get_memory_used_percentage() > _MEMORY_THRESHOLD
+        while len(self.caches) > 0 and (
+            self.get_memory_used_percentage() > _MEMORY_THRESHOLD
+            # Always keep the most recently used entry.
+            or (len(self.caches) > 1 and self._stored_bytes_fraction() > 1.0)
         ):
             lru_index = self._last_used.index(min(self._last_used))
             evicted_tokens = len(self.prompts[lru_index])
@@ -571,6 +595,21 @@ class KVPrefixCache:
         if evicted_any:
             gc.collect()
             mx.clear_cache()
+
+    def _stored_bytes_fraction(self) -> float:
+        """Stored entry bytes over PREFIX_CACHE_BYTE_LIMIT, the max across ranks
+        so every rank evicts the same entries."""
+        stored = sum(
+            prefix_entry_nbytes(cache, snapshots)
+            for cache, snapshots in zip(self.caches, self._snapshots, strict=True)
+        )
+        local_fraction = stored / PREFIX_CACHE_BYTE_LIMIT.in_bytes
+        if self._group is None:
+            return local_fraction
+        all_fractions = mx.distributed.all_gather(
+            mx.array([local_fraction], dtype=mx.float32), group=self._group
+        )
+        return float(mx.max(all_fractions).item())
 
     def get_memory_used_percentage(self) -> float:
         local_pressure: float = get_memory_used_percentage()

@@ -2,11 +2,13 @@
 from unittest.mock import patch
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.cache import ArraysCache, KVCache
 
+from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
     KVPrefixCache,
+    prefix_entry_nbytes,
     thin_snapshots,
 )
 
@@ -68,3 +70,50 @@ def test_agent_session_snapshots_stay_bounded() -> None:
     # Memory grows with position: stays within 5x the latest snapshot.
     assert sum(positions) <= 5 * positions[-1]
     assert len(positions) <= 12
+
+
+def _kv_entry(megabytes: int) -> list[KVCache]:
+    entry = KVCache()
+    keys = mx.zeros((1, 1, megabytes * 256, 1024), dtype=mx.float16)
+    entry.update_and_fetch(keys, keys)  # pyright: ignore[reportUnknownMemberType]
+    return [entry]
+
+
+def test_stored_entries_stay_within_byte_limit() -> None:
+    kv_prefix_cache = KVPrefixCache(None)
+    with (
+        patch(
+            "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+            return_value=0.0,
+        ),
+        patch(
+            "exo.worker.engines.mlx.cache.PREFIX_CACHE_BYTE_LIMIT",
+            Memory.from_mb(10),
+        ),
+    ):
+        for i in range(6):
+            kv_prefix_cache.add_kv_cache(
+                mx.full((2000,), i, dtype=mx.int32), _kv_entry(2)
+            )
+            stored = sum(
+                prefix_entry_nbytes(c, s)
+                for c, s in zip(
+                    kv_prefix_cache.caches, kv_prefix_cache._snapshots, strict=True
+                )
+            )
+            # Eviction runs before an add, so one new entry may exceed the limit.
+            assert stored <= Memory.from_mb(10).in_bytes + 4 * 2**20 + 2**20
+        # The newest entries are kept.
+        assert [int(p[0].item()) for p in kv_prefix_cache.prompts][-1] == 5
+
+        # An entry larger than the limit is still kept when it is the only one.
+        kv_prefix_cache.clear()
+        kv_prefix_cache.add_kv_cache(mx.full((2000,), 9, dtype=mx.int32), _kv_entry(20))
+        kv_prefix_cache.update_kv_cache(
+            0,
+            mx.full((2001,), 9, dtype=mx.int32),
+            _kv_entry(20),
+            None,
+            restore_pos=2000,
+        )
+        assert len(kv_prefix_cache.caches) == 1

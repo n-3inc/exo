@@ -105,14 +105,14 @@ def wire_memory_enabled() -> bool:
 # fill physical memory. On 4x M5 Pro 64GB with DeepSeek-V4-Flash, free memory
 # fell to ~1GB when a prefill started and Metal aborted with
 # kIOGPUCommandBufferCallbackErrorOutOfMemory although active memory was ~45GB.
-BUFFER_CACHE_LIMIT = Memory.from_gb(4)
+BUFFER_CACHE_LIMIT = Memory.from_gb(1)
 
 
 def limit_buffer_cache() -> None:
     if not mx.metal.is_available():
         return
     mx.set_cache_limit(BUFFER_CACHE_LIMIT.in_bytes)
-    logger.info(f"MLX buffer cache limited to {BUFFER_CACHE_LIMIT}.")
+    logger.info(f"MLX buffer cache limited to {BUFFER_CACHE_LIMIT.in_gb:.0f}GB.")
 
 
 def mlx_distributed_init(
