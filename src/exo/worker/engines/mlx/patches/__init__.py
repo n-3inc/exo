@@ -20,6 +20,9 @@ from exo.worker.engines.mlx.patches.shared_window_values import (
 )
 from exo.worker.engines.mlx.patches.standard_yarn_rope import patch_yarn_rope
 from exo.worker.engines.mlx.patches.switch_lhs_indices import patch_switch_lhs_indices
+from exo.worker.engines.mlx.patches.unwired_generation import (
+    patch_unwired_generation,
+)
 
 _applied = False
 
@@ -39,3 +42,4 @@ def apply_mlx_patches() -> None:
     patch_deepseek_v4_prefill_attention()
     patch_switch_lhs_indices()
     patch_deepseek_v4_hidden_capture()
+    patch_unwired_generation()
