@@ -15,6 +15,9 @@ from exo.worker.engines.mlx.patches.deepseek_v4_prefill_attention import (
     patch_deepseek_v4_prefill_attention,
 )
 from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+from exo.worker.engines.mlx.patches.shared_window_values import (
+    patch_shared_window_values,
+)
 from exo.worker.engines.mlx.patches.standard_yarn_rope import patch_yarn_rope
 from exo.worker.engines.mlx.patches.switch_lhs_indices import patch_switch_lhs_indices
 
@@ -29,6 +32,7 @@ def apply_mlx_patches() -> None:
     patch_yarn_rope()
     apply_batch_gen_patch()
     patch_deepseek_v4_cache_extend()
+    patch_shared_window_values()
     patch_deepseek_v4_moe_gate()
     patch_deepseek_v4_indexer()
     patch_deepseek_v4_decode_kernels()
