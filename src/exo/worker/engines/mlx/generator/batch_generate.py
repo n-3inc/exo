@@ -283,6 +283,18 @@ class ExoBatchGenerator:
                 prefill_tps=_prefill_tps,
             )
 
+        if self.kv_prefix_cache is not None:
+            snapshot_count = sum(len(s or []) for s in self.kv_prefix_cache._snapshots)  # pyright: ignore[reportPrivateUsage]
+        else:
+            snapshot_count = 0
+        logger.info(
+            f"Memory after prefill: active={mx.get_active_memory() / 1e9:.2f}GB "
+            f"cache={mx.get_cache_memory() / 1e9:.2f}GB peak={mx.get_peak_memory() / 1e9:.2f}GB "
+            f"prefix_entries={len(self.kv_prefix_cache.caches) if self.kv_prefix_cache else 0} "
+            f"snapshots={snapshot_count} new_snapshots={len(cache_snapshots)}"
+        )
+        mx.reset_peak_memory()
+
         last_tokens = prompt_tokens[-2:]
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
