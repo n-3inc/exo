@@ -48,8 +48,10 @@ _MEMORY_THRESHOLD = float(
 # Upper bound on the memory held by stored prefix-cache entries. On macOS
 # psutil counts reclaimable file cache as available, so the percentage above
 # can read 64% while the GPU is short of memory, and entries from every agent
-# session piled up until prefill stalled for minutes.
-PREFIX_CACHE_BYTE_LIMIT = Memory.from_gb(4)
+# session piled up until prefill stalled for minutes. 3GB holds two 60K-token
+# DeepSeek V4 sessions; with 4GB, decoding a 240K-token prompt next to them
+# left 2GB free on a 64GB node.
+PREFIX_CACHE_BYTE_LIMIT = Memory.from_gb(3)
 
 
 def _cache_entry_nbytes(c: object) -> int:
