@@ -140,7 +140,28 @@ def _detached_copies(arrays: list[mx.array | None]) -> list[mx.array | None]:
     return copies
 
 
-def _copy_v4_caches(caches: list[DeepseekV4Cache]) -> list[DeepseekV4Cache]:
+class PoolReferencingV4Cache(DeepseekV4Cache):
+    """A DeepseekV4Cache snapshot that records how many compressed-pool rows
+    each branch had instead of copying the pool.
+
+    The pool only grows by appending rows (``update_pool`` concatenates), so
+    any later cache for the same prompt starts with exactly these rows; a
+    restore slices them from that cache. The pool is the only part that grows
+    with the context (2.4 GB per snapshot at 350K tokens on DeepSeek V4
+    Flash); everything copied here is bounded by the window and ratio.
+    """
+
+    pool_rows: dict[str, int]
+
+
+def _references_pool(branch: CompressorBranch) -> bool:
+    # Batched (per-row length) pools are rebuilt on merge, so copy those.
+    return branch.pool is not None and branch.pool_lengths is None
+
+
+def _copy_v4_caches(
+    caches: list[DeepseekV4Cache], reference_pools: bool = False
+) -> list[DeepseekV4Cache]:
     sources: list[mx.array | None] = []
     for c in caches:
         local: RotatingKVCache = c.local
@@ -156,7 +177,9 @@ def _copy_v4_caches(caches: list[DeepseekV4Cache]) -> list[DeepseekV4Cache]:
                     branch.buffer_gate,
                     branch.prev_kv,
                     branch.prev_gate,
-                    branch.pool,
+                    None
+                    if reference_pools and _references_pool(branch)
+                    else branch.pool,
                 ]
             )
     copies = iter(_detached_copies(sources))
@@ -172,7 +195,17 @@ def _copy_v4_caches(caches: list[DeepseekV4Cache]) -> list[DeepseekV4Cache]:
         local_snap.keep = local.keep
         local_snap.max_size = local.max_size
 
-        snap = DeepseekV4Cache.__new__(DeepseekV4Cache)
+        snap = (
+            PoolReferencingV4Cache.__new__(PoolReferencingV4Cache)
+            if reference_pools
+            else DeepseekV4Cache.__new__(DeepseekV4Cache)
+        )
+        if isinstance(snap, PoolReferencingV4Cache):
+            snap.pool_rows = {
+                key: branch.pool.shape[1]
+                for key, branch in c._branches.items()
+                if branch.pool is not None and _references_pool(branch)
+            }
         snap.local = local_snap
         snap._branches = {}
         for key, branch in c._branches.items():
@@ -196,9 +229,30 @@ def _copy_v4_cache(c: DeepseekV4Cache) -> DeepseekV4Cache:
     return _copy_v4_caches([c])[0]
 
 
+def _restore_v4_cache(snap: PoolReferencingV4Cache, source: object) -> DeepseekV4Cache:
+    """Copy ``snap`` and take its pool rows from ``source``, a later cache of
+    the same prompt (the cache being rolled back)."""
+    if not isinstance(source, DeepseekV4Cache):
+        raise ValueError("pool-referencing snapshot restored without its cache")
+    restored = _copy_v4_cache(snap)
+    for key, rows in snap.pool_rows.items():
+        pool = source._branches[key].pool
+        if (
+            pool is None
+            or source._branches[key].pool_lengths is not None
+            or pool.shape[1] < rows
+        ):
+            raise ValueError(f"cache holds fewer {key} pool rows than snapshot")
+        restored._branches[key].pool = pool[:, :rows]
+    return restored
+
+
 def copy_snapshot_entry(
     entry: ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None,
+    source: object = None,
 ) -> ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None:
+    """Copy a snapshot entry to restore it. ``source`` is the cache entry being
+    replaced; pool-referencing DeepSeek V4 snapshots take their pool from it."""
     match entry:
         case None:
             return None
@@ -209,6 +263,8 @@ def copy_snapshot_entry(
             return _copy_arrays_cache(entry)
         case CacheList():
             return _copy_cache_list(entry)
+        case PoolReferencingV4Cache():
+            return _restore_v4_cache(entry, source)
         case DeepseekV4Cache():
             return _copy_v4_cache(entry)
 
@@ -228,7 +284,7 @@ def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
             # DeepseekV4Cache entries are copied together below.
             states.append(None)
     v4_entries = [(i, c) for i, c in enumerate(cache) if isinstance(c, DeepseekV4Cache)]
-    v4_snaps = _copy_v4_caches([c for _, c in v4_entries])
+    v4_snaps = _copy_v4_caches([c for _, c in v4_entries], reference_pools=True)
     for (i, _), snap in zip(v4_entries, v4_snaps, strict=True):
         states[i] = snap
     token_count = cache_length(cache)
@@ -434,7 +490,13 @@ class KVPrefixCache:
         prompt_cache = deepcopy(self.caches[best_index])
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
-            trim_cache(prompt_cache, tokens_to_trim, restore_snap)
+            try:
+                trim_cache(prompt_cache, tokens_to_trim, restore_snap)
+            except ValueError:
+                logger.warning(
+                    "Prefix cache snapshot unusable; prefilling from scratch"
+                )
+                return make_kv_cache(model), prompt_tokens, None, False
             # Reset cache offset to match trimmed length
             for c in prompt_cache:
                 if isinstance(c, (ArraysCache, RotatingKVCache)):
@@ -533,7 +595,7 @@ def trim_cache(
     for i, c in enumerate(cache):
         if is_non_trimmable_cache_entry(c):
             if snapshot is not None and snapshot.states[i] is not None:
-                restored = copy_snapshot_entry(snapshot.states[i])
+                restored = copy_snapshot_entry(snapshot.states[i], c)
                 if restored is not None:
                     cache[i] = restored  # type: ignore
             elif isinstance(c, DeepseekV4Cache):
