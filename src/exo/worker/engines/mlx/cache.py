@@ -399,6 +399,19 @@ class KVPrefixCache:
         self._last_used.append(self._access_counter)
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
 
+    def continues_entry(self, index: int, prefix_hit_length: int) -> bool:
+        """Whether a prompt that restored ``prefix_hit_length`` tokens from
+        entry ``index`` continues it, rather than branching off part of it.
+
+        Agent sessions share a long system prompt, so a hit can cover most of
+        a short prompt while belonging to another session. Replacing that
+        session's entry made two concurrent sessions evict each other and
+        re-prefill their whole history on every turn.
+        """
+        # Prefill trims the last two prompt tokens, so a continuation
+        # restores from two tokens before the end of the stored prompt.
+        return prefix_hit_length >= len(self.prompts[index]) - 2
+
     def update_kv_cache(
         self,
         index: int,

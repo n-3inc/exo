@@ -117,3 +117,15 @@ def test_stored_entries_stay_within_byte_limit() -> None:
             restore_pos=2000,
         )
         assert len(kv_prefix_cache.caches) == 1
+
+
+def test_only_a_continuation_replaces_an_entry() -> None:
+    kv_prefix_cache = KVPrefixCache(None)
+    with patch(
+        "exo.worker.engines.mlx.cache.get_memory_used_percentage", return_value=0.0
+    ):
+        kv_prefix_cache.add_kv_cache(mx.zeros((4437,), dtype=mx.int32), _kv_entry(1))
+    # The same session's next turn restores up to two tokens before the end.
+    assert kv_prefix_cache.continues_entry(0, 4435)
+    # Another session that only shares the 4096-token system prompt.
+    assert not kv_prefix_cache.continues_entry(0, 4096)
