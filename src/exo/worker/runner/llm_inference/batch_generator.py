@@ -435,6 +435,10 @@ class BatchGenerator(Engine):
         ):
             self._steps_since_admission_check = 0
             if not self._gen.admits(self._prompt(self._queue[0])):
+                logger.info(
+                    f"Task {self._queue[0].task_id} waits for memory next to "
+                    f"{len(self._active_tasks)} active"
+                )
                 break
             task = self._queue.popleft()
             try:
