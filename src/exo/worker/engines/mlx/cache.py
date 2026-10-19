@@ -53,10 +53,20 @@ _MEMORY_THRESHOLD = float(
 # left 2GB free on a 64GB node.
 PREFIX_CACHE_BYTE_LIMIT = Memory.from_gb(3)
 
-# Free memory a request must leave to be let in next to others, after its
-# KV cache and its prefill (which holds about one more KV cache's worth of
-# its uncached tokens at its peak).
-PREFILL_RESERVE = Memory.from_gb(3)
+# MLX memory a rank may hold before requests wait for others to finish:
+# all of RAM but 12GB for macOS and the other processes. JACCL instances
+# leave MLX memory unwired, so past this macOS compresses the runner's
+# buffers instead of reporting memory as short: with six agent sessions a
+# rank compressed 28.8GB while psutil and memory_pressure showed 40-80% free.
+MLX_MEMORY_BUDGET = Memory.from_bytes(
+    psutil.virtual_memory().total - Memory.from_gb(12).in_bytes
+)
+
+
+def _mlx_headroom() -> float:
+    return float(
+        MLX_MEMORY_BUDGET.in_bytes - mx.get_active_memory() - mx.get_cache_memory()
+    )
 
 
 def _cache_entry_nbytes(c: object) -> int:
@@ -619,13 +629,15 @@ class KVPrefixCache:
     def admits(self, prompt_tokens: mx.array, others_active: bool) -> bool:
         """Whether a request fits next to the ones already decoding.
 
-        Evicts LRU entries until every rank has room for the request's KV
-        cache and its prefill plus PREFILL_RESERVE. A request that still does
-        not fit waits while others are active; alone, it is let in anyway.
+        Evicts LRU entries until every rank has room within
+        MLX_MEMORY_BUDGET for the request's KV cache and its prefill (about
+        one more KV cache's worth of its uncached tokens at its peak). A
+        request that still does not fit waits while others are active; alone,
+        it is let in anyway.
 
         Six agent sessions, three of them with a 240K-token prompt, held 8GB
-        of KV cache next to 2.8GB of stored entries, and one rank was left
-        with less than nothing free.
+        of KV cache next to 2.8GB of stored entries, and macOS compressed
+        28.8GB of one rank's memory.
         """
         stored_tokens = sum(len(prompt) for prompt in self.prompts)
         if stored_tokens > 0:
@@ -645,25 +657,17 @@ class KVPrefixCache:
             (get_prefix_length(prompt_tokens, prompt) for prompt in self.prompts),
             default=0,
         )
-        needed = (
-            total + total - cached
-        ) * self._bytes_per_token + PREFILL_RESERVE.in_bytes
+        needed = (total + total - cached) * self._bytes_per_token
 
         def fits() -> bool:
-            return (
-                _min_across_ranks(float(get_available_memory().in_bytes), self._group)
-                >= needed
-            )
+            return _min_across_ranks(_mlx_headroom(), self._group) >= needed
 
-        evicted_any = False
         fit = fits()
         while not fit and self.caches:
             self._evict_lru()
-            evicted_any = True
-            fit = fits()
-        if evicted_any:
             gc.collect()
             mx.clear_cache()
+            fit = fits()
         return fit or not others_active
 
     def _evict_lru(self) -> int:

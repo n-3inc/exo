@@ -169,10 +169,9 @@ def test_a_request_that_fits_is_admitted_without_evicting() -> None:
     prompt = mx.concatenate(
         [mx.full((1000,), 2, mx.int32), mx.full((500,), 9, mx.int32)]
     )
-    free = (1500 + 500) * per_token + Memory.from_gb(3).in_bytes
     with patch(
-        "exo.worker.engines.mlx.cache.get_available_memory",
-        return_value=Memory.from_bytes(int(free) + 1),
+        "exo.worker.engines.mlx.cache._mlx_headroom",
+        return_value=(1500 + 500) * per_token + 1,
     ):
         assert kv_prefix_cache.admits(prompt, others_active=True)
     assert len(kv_prefix_cache.caches) == 3
@@ -181,7 +180,7 @@ def test_a_request_that_fits_is_admitted_without_evicting() -> None:
 def test_entries_are_evicted_before_a_request_waits() -> None:
     kv_prefix_cache, per_token = _three_entries()
     prompt = mx.full((5000,), 7, mx.int32)  # nothing cached
-    needed = 2 * 5000 * per_token + Memory.from_gb(3).in_bytes
+    needed = 2 * 5000 * per_token
     # Each eviction frees one entry's worth; two of them are enough.
     free = [needed - 2 * 1000 * per_token]
     original_evict = kv_prefix_cache._evict_lru
@@ -192,8 +191,8 @@ def test_entries_are_evicted_before_a_request_waits() -> None:
 
     with (
         patch(
-            "exo.worker.engines.mlx.cache.get_available_memory",
-            side_effect=lambda: Memory.from_bytes(int(free[0]) + 1),
+            "exo.worker.engines.mlx.cache._mlx_headroom",
+            side_effect=lambda: free[0] + 1,
         ),
         patch.object(kv_prefix_cache, "_evict_lru", side_effect=evict),
     ):
@@ -204,10 +203,7 @@ def test_entries_are_evicted_before_a_request_waits() -> None:
 def test_a_request_that_cannot_fit_waits_only_while_others_run() -> None:
     kv_prefix_cache, _ = _three_entries()
     prompt = mx.full((5000,), 7, mx.int32)
-    with patch(
-        "exo.worker.engines.mlx.cache.get_available_memory",
-        return_value=Memory.from_bytes(0),
-    ):
+    with patch("exo.worker.engines.mlx.cache._mlx_headroom", return_value=0.0):
         assert not kv_prefix_cache.admits(prompt, others_active=True)
         assert kv_prefix_cache.caches == []
         assert kv_prefix_cache.admits(prompt, others_active=False)
