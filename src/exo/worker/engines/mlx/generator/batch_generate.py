@@ -49,6 +49,7 @@ from exo.worker.engines.mlx.patches.opt_batch_gen import (
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
+    mx_barrier,
     system_prompt_token_count,
     wire_memory_enabled,
 )
@@ -304,6 +305,13 @@ class ExoBatchGenerator:
             f"prefix_bytes={prefix_bytes / 1e9:.2f}GB"
         )
         mx.reset_peak_memory()
+
+        # Saving the prefix cache takes a different time on each rank (deep
+        # copies, eviction). Wait for the slowest rank here, on the CPU: the
+        # next decode step's collectives are waited on by the GPU, in a Metal
+        # fence that gives up after ~15s and then decodes stale data, so a
+        # rank arriving later than that leaves the ranks out of step.
+        mx_barrier(self.group)
 
         last_tokens = prompt_tokens[-2:]
 

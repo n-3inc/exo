@@ -1,7 +1,7 @@
 import gc
 import os
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -628,27 +628,28 @@ class KVPrefixCache:
             prefix_entry_nbytes(cache, snapshots)
             for cache, snapshots in zip(self.caches, self._snapshots, strict=True)
         )
-        local_fraction = stored / PREFIX_CACHE_BYTE_LIMIT.in_bytes
-        if self._group is None:
-            return local_fraction
-        all_fractions = mx.distributed.all_gather(
-            mx.array([local_fraction], dtype=mx.float32), group=self._group
-        )
-        return float(mx.max(all_fractions).item())
+        return _max_across_ranks(stored / PREFIX_CACHE_BYTE_LIMIT.in_bytes, self._group)
 
     def get_memory_used_percentage(self) -> float:
-        local_pressure: float = get_memory_used_percentage()
+        return _max_across_ranks(get_memory_used_percentage(), self._group)
 
-        if self._group is None:
-            return local_pressure
 
-        all_pressure = mx.distributed.all_gather(
-            mx.array([local_pressure], dtype=mx.float32),
-            group=self._group,
-        )
-        # .item() evals.
-        max_pressure = float(mx.max(all_pressure).item())
-        return max_pressure
+def _max_across_ranks(value: float, group: mx.distributed.Group | None) -> float:
+    """The largest ``value`` of any rank, so every rank takes the same branch.
+
+    The gathered values are read on the CPU. A GPU op on them (``mx.max``)
+    waits for the slowest rank in a Metal fence that gives up after ~15s and
+    then computes on stale data: on 4x M5 Pro, a rank that saved its prefix
+    cache 30s later than the others made two ranks evict entries the other
+    two kept, and the ranks' collectives went out of step until jaccl
+    segfaulted.
+    """
+    if group is None:
+        return value
+    gathered = mx.distributed.all_gather(
+        mx.array([value], dtype=mx.float32), group=group
+    )
+    return max(cast(list[float], gathered.tolist()))
 
 
 def trim_cache(
