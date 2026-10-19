@@ -167,6 +167,9 @@ class FakeExoBatchGenerator:
     def has_work(self) -> bool:
         return bool(self._pending)
 
+    def admits(self, prompt: str) -> bool:
+        return True
+
     def submit(
         self,
         task_params: object = None,

@@ -102,6 +102,7 @@ class ExoBatchGenerator:
 
     _mlx_gen: MlxBatchGenerator = field(init=False)
     _active_tasks: dict[int, _EngineTask] = field(default_factory=dict, init=False)
+    _admission_prompt: tuple[str, mx.array] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._mlx_gen = MlxBatchGenerator(
@@ -113,6 +114,17 @@ class ExoBatchGenerator:
             # mlx_lm's BatchGenerator wires memory when it is created.
             mx.set_wired_limit(0)
         self._step_count = 0
+
+    def admits(self, prompt: str) -> bool:
+        """Whether a request with ``prompt`` fits next to the active ones now;
+        see KVPrefixCache.admits. The same on every rank."""
+        if self.kv_prefix_cache is None:
+            return True
+        if self._admission_prompt is None or self._admission_prompt[0] is not prompt:
+            self._admission_prompt = (prompt, encode_prompt(self.tokenizer, prompt))
+        return self.kv_prefix_cache.admits(
+            self._admission_prompt[1], others_active=self.has_work
+        )
 
     @property
     def has_work(self) -> bool:
@@ -208,10 +220,6 @@ class ExoBatchGenerator:
             else contextlib.nullcontext()
         )
         uncached_count = len(prompt_tokens)
-        if self.kv_prefix_cache is not None:
-            matched_index = self.kv_prefix_cache.make_room_for_prefill(
-                uncached_count, matched_index
-            )
         use_remote = (
             uncached_count > REMOTE_PREFILL_MIN_TOKENS
             and task_params.prefill_endpoint is not None

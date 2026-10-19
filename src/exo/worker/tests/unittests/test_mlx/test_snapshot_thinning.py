@@ -151,7 +151,7 @@ def test_restores_from_the_entry_that_restores_most() -> None:
     assert len(remaining) == len(query) - 5498
 
 
-def test_a_long_prefill_evicts_entries_until_it_fits() -> None:
+def _three_entries() -> tuple[KVPrefixCache, float]:
     kv_prefix_cache = KVPrefixCache(None)
     with patch(
         "exo.worker.engines.mlx.cache.get_memory_used_percentage", return_value=0.0
@@ -160,43 +160,54 @@ def test_a_long_prefill_evicts_entries_until_it_fits() -> None:
             kv_prefix_cache.add_kv_cache(
                 mx.full((1000,), i, dtype=mx.int32), _kv_entry(1)
             )
-    per_token = prefix_entry_nbytes(kv_prefix_cache.caches[0], None) / 1000
-    reserve = Memory.from_gb(4).in_bytes
-    # Room for a short prompt: nothing is evicted.
-    free = [reserve + 1000 * per_token * 2.0 + 1]
+    return kv_prefix_cache, prefix_entry_nbytes(kv_prefix_cache.caches[0], None) / 1000
+
+
+def test_a_request_that_fits_is_admitted_without_evicting() -> None:
+    kv_prefix_cache, per_token = _three_entries()
+    # A follow-up of entry 2: 1000 cached + 500 new tokens.
+    prompt = mx.concatenate(
+        [mx.full((1000,), 2, mx.int32), mx.full((500,), 9, mx.int32)]
+    )
+    free = (1500 + 500) * per_token + Memory.from_gb(3).in_bytes
     with patch(
         "exo.worker.engines.mlx.cache.get_available_memory",
-        side_effect=lambda: Memory.from_bytes(int(free[0])),
+        return_value=Memory.from_bytes(int(free) + 1),
     ):
-        assert kv_prefix_cache.make_room_for_prefill(1000, 2) == 2
-        assert len(kv_prefix_cache.caches) == 3
+        assert kv_prefix_cache.admits(prompt, others_active=True)
+    assert len(kv_prefix_cache.caches) == 3
 
-        # A long prompt that needs every entry gone: each eviction frees memory.
-        original_evict = kv_prefix_cache._evict_lru
 
-        def evict() -> int:
-            free[0] += 1000 * per_token
-            return original_evict()
+def test_entries_are_evicted_before_a_request_waits() -> None:
+    kv_prefix_cache, per_token = _three_entries()
+    prompt = mx.full((5000,), 7, mx.int32)  # nothing cached
+    needed = 2 * 5000 * per_token + Memory.from_gb(3).in_bytes
+    # Each eviction frees one entry's worth; two of them are enough.
+    free = [needed - 2 * 1000 * per_token]
+    original_evict = kv_prefix_cache._evict_lru
 
-        with patch.object(kv_prefix_cache, "_evict_lru", side_effect=evict):
-            needed_tokens = int(
-                (free[0] + 2000 * per_token - reserve) / per_token / 2.0
-            )
-            assert kv_prefix_cache.make_room_for_prefill(needed_tokens, 2) == 0
-    # The two least recently used entries went; the matched one moved to 0.
+    def evict() -> int:
+        free[0] += 1000 * per_token
+        return original_evict()
+
+    with (
+        patch(
+            "exo.worker.engines.mlx.cache.get_available_memory",
+            side_effect=lambda: Memory.from_bytes(int(free[0]) + 1),
+        ),
+        patch.object(kv_prefix_cache, "_evict_lru", side_effect=evict),
+    ):
+        assert kv_prefix_cache.admits(prompt, others_active=True)
     assert len(kv_prefix_cache.caches) == 1
-    assert int(kv_prefix_cache.prompts[0][0].item()) == 2
 
 
-def test_evicting_the_matched_entry_returns_none() -> None:
-    kv_prefix_cache = KVPrefixCache(None)
-    with patch(
-        "exo.worker.engines.mlx.cache.get_memory_used_percentage", return_value=0.0
-    ):
-        kv_prefix_cache.add_kv_cache(mx.zeros((1000,), dtype=mx.int32), _kv_entry(1))
+def test_a_request_that_cannot_fit_waits_only_while_others_run() -> None:
+    kv_prefix_cache, _ = _three_entries()
+    prompt = mx.full((5000,), 7, mx.int32)
     with patch(
         "exo.worker.engines.mlx.cache.get_available_memory",
         return_value=Memory.from_bytes(0),
     ):
-        assert kv_prefix_cache.make_room_for_prefill(10, 0) is None
-    assert kv_prefix_cache.caches == []
+        assert not kv_prefix_cache.admits(prompt, others_active=True)
+        assert kv_prefix_cache.caches == []
+        assert kv_prefix_cache.admits(prompt, others_active=False)

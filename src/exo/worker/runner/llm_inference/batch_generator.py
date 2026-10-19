@@ -341,6 +341,8 @@ class BatchGenerator(Engine):
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
     _gen: ExoBatchGenerator = field(init=False)
     _steps_since_task_agreement: int = field(default=0, init=False)
+    _steps_since_admission_check: int = field(default=0, init=False)
+    _prompts: dict[TaskId, str] = field(default_factory=dict, init=False)
     _active_tasks: dict[
         int,
         tuple[
@@ -419,8 +421,21 @@ class BatchGenerator(Engine):
                 self._steps_since_task_agreement = 0
                 self.agree_on_tasks()
 
-        # Submit any queued tasks to the engine
-        while self._queue and len(self._active_tasks) < EXO_MAX_CONCURRENT_REQUESTS:
+        # Submit any queued tasks to the engine, as long as they fit in memory
+        # next to the active ones. Checking syncs with the GPU, so a waiting
+        # task is checked again only every few steps (the same on every rank).
+        self._steps_since_admission_check += 1
+        while (
+            self._queue
+            and len(self._active_tasks) < EXO_MAX_CONCURRENT_REQUESTS
+            and (
+                not self._gen.has_work
+                or self._steps_since_admission_check >= _TASK_AGREEMENT_INTERVAL_STEPS
+            )
+        ):
+            self._steps_since_admission_check = 0
+            if not self._gen.admits(self._prompt(self._queue[0])):
+                break
             task = self._queue.popleft()
             try:
                 uid = self._start_task(task)
@@ -520,9 +535,18 @@ class BatchGenerator(Engine):
                 )
             )
 
+    def _prompt(self, task: TextGeneration) -> str:
+        if task.task_id not in self._prompts:
+            self._prompts[task.task_id] = apply_chat_template(
+                self.tokenizer, task.task_params
+            )
+        return self._prompts[task.task_id]
+
     def _start_task(self, task: TextGeneration) -> int:
         _check_for_debug_prompts(task.task_params)
-        prompt = apply_chat_template(self.tokenizer, task.task_params)
+        prompt = self._prompts.pop(task.task_id, None) or apply_chat_template(
+            self.tokenizer, task.task_params
+        )
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:

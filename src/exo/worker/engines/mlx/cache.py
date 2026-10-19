@@ -53,11 +53,10 @@ _MEMORY_THRESHOLD = float(
 # left 2GB free on a 64GB node.
 PREFIX_CACHE_BYTE_LIMIT = Memory.from_gb(3)
 
-# Free memory to leave while a prompt is prefilled, and the prefill's peak
-# memory per byte of KV cache it adds (a 180K-token prefill of DeepSeek V4
-# Flash, 18KB/token of cache per rank, peaked ~5.5GB above where it started).
-PREFILL_RESERVE = Memory.from_gb(4)
-_PREFILL_PEAK_PER_KV_BYTE = 2.0
+# Free memory a request must leave to be let in next to others, after its
+# KV cache and its prefill (which holds about one more KV cache's worth of
+# its uncached tokens at its peak).
+PREFILL_RESERVE = Memory.from_gb(3)
 
 
 def _cache_entry_nbytes(c: object) -> int:
@@ -378,6 +377,7 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        self._bytes_per_token: float | None = None
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -616,45 +616,55 @@ class KVPrefixCache:
             gc.collect()
             mx.clear_cache()
 
-    def make_room_for_prefill(
-        self, uncached_tokens: int, matched_index: int | None
-    ) -> int | None:
-        """Evict LRU entries until every rank has room to prefill
-        ``uncached_tokens`` and still keep PREFILL_RESERVE free. Returns the
-        index of entry ``matched_index`` afterwards, or None if it was evicted.
+    def admits(self, prompt_tokens: mx.array, others_active: bool) -> bool:
+        """Whether a request fits next to the ones already decoding.
 
-        Prefilling a 240K-token prompt holds ~5.5GB more than before on a
-        4x M5 Pro rank. With six agent sessions decoding next to it and 2.8GB
-        of stored entries, a rank was left with 0.95GB free.
+        Evicts LRU entries until every rank has room for the request's KV
+        cache and its prefill plus PREFILL_RESERVE. A request that still does
+        not fit waits while others are active; alone, it is let in anyway.
+
+        Six agent sessions, three of them with a 240K-token prompt, held 8GB
+        of KV cache next to 2.8GB of stored entries, and one rank was left
+        with less than nothing free.
         """
         stored_tokens = sum(len(prompt) for prompt in self.prompts)
-        if stored_tokens == 0:
-            return matched_index
-        stored_bytes = sum(
-            prefix_entry_nbytes(cache, snapshots)
-            for cache, snapshots in zip(self.caches, self._snapshots, strict=True)
+        if stored_tokens > 0:
+            self._bytes_per_token = (
+                sum(
+                    prefix_entry_nbytes(cache, snapshots)
+                    for cache, snapshots in zip(
+                        self.caches, self._snapshots, strict=True
+                    )
+                )
+                / stored_tokens
+            )
+        if self._bytes_per_token is None:
+            return True
+        total = len(prompt_tokens)
+        cached = max(
+            (get_prefix_length(prompt_tokens, prompt) for prompt in self.prompts),
+            default=0,
         )
         needed = (
-            uncached_tokens * stored_bytes / stored_tokens * _PREFILL_PEAK_PER_KV_BYTE
-            + PREFILL_RESERVE.in_bytes
-        )
+            total + total - cached
+        ) * self._bytes_per_token + PREFILL_RESERVE.in_bytes
+
+        def fits() -> bool:
+            return (
+                _min_across_ranks(float(get_available_memory().in_bytes), self._group)
+                >= needed
+            )
+
         evicted_any = False
-        while (
-            self.caches
-            and _min_across_ranks(float(get_available_memory().in_bytes), self._group)
-            < needed
-        ):
-            evicted = self._evict_lru()
-            if matched_index is not None:
-                if evicted == matched_index:
-                    matched_index = None
-                elif evicted < matched_index:
-                    matched_index -= 1
+        fit = fits()
+        while not fit and self.caches:
+            self._evict_lru()
             evicted_any = True
+            fit = fits()
         if evicted_any:
             gc.collect()
             mx.clear_cache()
-        return matched_index
+        return fit or not others_active
 
     def _evict_lru(self) -> int:
         lru_index = self._last_used.index(min(self._last_used))
