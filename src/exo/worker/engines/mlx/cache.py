@@ -53,6 +53,12 @@ _MEMORY_THRESHOLD = float(
 # left 2GB free on a 64GB node.
 PREFIX_CACHE_BYTE_LIMIT = Memory.from_gb(3)
 
+# Free memory to leave while a prompt is prefilled, and the prefill's peak
+# memory per byte of KV cache it adds (a 180K-token prefill of DeepSeek V4
+# Flash, 18KB/token of cache per rank, peaked ~5.5GB above where it started).
+PREFILL_RESERVE = Memory.from_gb(4)
+_PREFILL_PEAK_PER_KV_BYTE = 2.0
+
 
 def _cache_entry_nbytes(c: object) -> int:
     try:
@@ -603,23 +609,66 @@ class KVPrefixCache:
             # Always keep the most recently used entry.
             or (len(self.caches) > 1 and self._stored_bytes_fraction() > 1.0)
         ):
-            lru_index = self._last_used.index(min(self._last_used))
-            evicted_tokens = len(self.prompts[lru_index])
-            self.prompts.pop(lru_index)
-            self.caches.pop(lru_index)
-            self._snapshots.pop(lru_index)
-            self._media_regions.pop(lru_index)
-            self._last_used.pop(lru_index)
-            self.prefill_tps.pop(lru_index)
-
+            self._evict_lru()
             evicted_any = True
-            logger.info(
-                f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
-            )
 
         if evicted_any:
             gc.collect()
             mx.clear_cache()
+
+    def make_room_for_prefill(
+        self, uncached_tokens: int, matched_index: int | None
+    ) -> int | None:
+        """Evict LRU entries until every rank has room to prefill
+        ``uncached_tokens`` and still keep PREFILL_RESERVE free. Returns the
+        index of entry ``matched_index`` afterwards, or None if it was evicted.
+
+        Prefilling a 240K-token prompt holds ~5.5GB more than before on a
+        4x M5 Pro rank. With six agent sessions decoding next to it and 2.8GB
+        of stored entries, a rank was left with 0.95GB free.
+        """
+        stored_tokens = sum(len(prompt) for prompt in self.prompts)
+        if stored_tokens == 0:
+            return matched_index
+        stored_bytes = sum(
+            prefix_entry_nbytes(cache, snapshots)
+            for cache, snapshots in zip(self.caches, self._snapshots, strict=True)
+        )
+        needed = (
+            uncached_tokens * stored_bytes / stored_tokens * _PREFILL_PEAK_PER_KV_BYTE
+            + PREFILL_RESERVE.in_bytes
+        )
+        evicted_any = False
+        while (
+            self.caches
+            and _min_across_ranks(float(get_available_memory().in_bytes), self._group)
+            < needed
+        ):
+            evicted = self._evict_lru()
+            if matched_index is not None:
+                if evicted == matched_index:
+                    matched_index = None
+                elif evicted < matched_index:
+                    matched_index -= 1
+            evicted_any = True
+        if evicted_any:
+            gc.collect()
+            mx.clear_cache()
+        return matched_index
+
+    def _evict_lru(self) -> int:
+        lru_index = self._last_used.index(min(self._last_used))
+        evicted_tokens = len(self.prompts[lru_index])
+        self.prompts.pop(lru_index)
+        self.caches.pop(lru_index)
+        self._snapshots.pop(lru_index)
+        self._media_regions.pop(lru_index)
+        self._last_used.pop(lru_index)
+        self.prefill_tps.pop(lru_index)
+        logger.info(
+            f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
+        )
+        return lru_index
 
     def _stored_bytes_fraction(self) -> float:
         """Stored entry bytes over PREFIX_CACHE_BYTE_LIMIT, the max across ranks
@@ -632,6 +681,10 @@ class KVPrefixCache:
 
     def get_memory_used_percentage(self) -> float:
         return _max_across_ranks(get_memory_used_percentage(), self._group)
+
+
+def _min_across_ranks(value: float, group: mx.distributed.Group | None) -> float:
+    return -_max_across_ranks(-value, group)
 
 
 def _max_across_ranks(value: float, group: mx.distributed.Group | None) -> float:

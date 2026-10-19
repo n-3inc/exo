@@ -208,6 +208,10 @@ class ExoBatchGenerator:
             else contextlib.nullcontext()
         )
         uncached_count = len(prompt_tokens)
+        if self.kv_prefix_cache is not None:
+            matched_index = self.kv_prefix_cache.make_room_for_prefill(
+                uncached_count, matched_index
+            )
         use_remote = (
             uncached_count > REMOTE_PREFILL_MIN_TOKENS
             and task_params.prefill_endpoint is not None
