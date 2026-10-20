@@ -20,6 +20,7 @@ from exo.shared.types.chunks import (
     PrefillProgressChunk,
     TokenChunk,
     ToolCallChunk,
+    ToolCallDeltaChunk,
 )
 from exo.shared.types.common import CommandId, ModelId
 
@@ -193,3 +194,59 @@ class TestNonStreamingResponseShape:
         assert "function_call" not in message
         assert "name" not in message
         assert "tool_call_id" not in message
+
+
+async def test_tool_call_pieces_stream_as_openai_deltas() -> None:
+    arguments = '{"path": "a.py", "content": "x = 1\\n"}'
+    pieces = [arguments[:10], arguments[10:25], arguments[25:-3]]
+    chunks: list[
+        PrefillProgressChunk
+        | ErrorChunk
+        | ToolCallChunk
+        | ToolCallDeltaChunk
+        | TokenChunk
+    ] = [
+        ToolCallDeltaChunk(
+            model=_TEST_MODEL,
+            index=0,
+            id="call-1",
+            name="write" if i == 0 else None,
+            arguments=piece,
+        )
+        for i, piece in enumerate(pieces)
+    ]
+    chunks.append(
+        ToolCallChunk(
+            model=_TEST_MODEL,
+            tool_calls=[ToolCallItem(id="call-1", name="write", arguments=arguments)],
+            usage=_make_usage(),
+        )
+    )
+
+    async def stream() -> AsyncGenerator[
+        PrefillProgressChunk
+        | ErrorChunk
+        | ToolCallChunk
+        | ToolCallDeltaChunk
+        | TokenChunk,
+        None,
+    ]:
+        for chunk in chunks:
+            yield chunk
+
+    lines = [line async for line in generate_chat_stream(CommandId("c"), stream())]
+    events = _parse_data_events(lines)
+    tool_deltas = [
+        call for event in events for call in event["choices"][0]["delta"]["tool_calls"]
+    ]
+    # The first piece names the call; the rest carry only arguments.
+    assert tool_deltas[0]["id"] == "call-1"
+    assert tool_deltas[0]["type"] == "function"
+    assert tool_deltas[0]["function"]["name"] == "write"
+    assert all("id" not in d and "name" not in d["function"] for d in tool_deltas[1:])
+    assert all(d["index"] == 0 for d in tool_deltas)
+    # The arguments add up exactly once; the finish chunk sends the rest.
+    assert "".join(d["function"]["arguments"] for d in tool_deltas) == arguments
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert events[-1]["usage"]["completion_tokens"] == 1
+    assert lines[-1] == "data: [DONE]\n\n"

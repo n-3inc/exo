@@ -151,6 +151,7 @@ from exo.shared.types.chunks import (
     PrefillProgressChunk,
     TokenChunk,
     ToolCallChunk,
+    ToolCallDeltaChunk,
 )
 from exo.shared.types.commands import (
     AddCustomModelCard,
@@ -287,7 +288,13 @@ class API:
 
         self._text_generation_queues: dict[
             CommandId,
-            Sender[TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk],
+            Sender[
+                TokenChunk
+                | ErrorChunk
+                | ToolCallChunk
+                | ToolCallDeltaChunk
+                | PrefillProgressChunk
+            ],
         ] = {}
         self._image_generation_queues: dict[
             CommandId, Sender[ImageChunk | ErrorChunk]
@@ -759,13 +766,33 @@ class API:
     ) -> AsyncGenerator[
         TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk, None
     ]:
+        """Chunks for a command without the pieces of tool calls being
+        generated: the adapters that use this wait for the complete call."""
+        async for chunk in self._chunk_stream_with_tool_call_deltas(command_id):
+            if not isinstance(chunk, ToolCallDeltaChunk):
+                yield chunk
+
+    async def _chunk_stream_with_tool_call_deltas(
+        self, command_id: CommandId
+    ) -> AsyncGenerator[
+        TokenChunk
+        | ErrorChunk
+        | ToolCallChunk
+        | ToolCallDeltaChunk
+        | PrefillProgressChunk,
+        None,
+    ]:
         """Yield chunks for a given command until completion.
 
         This is the internal low-level stream used by all API adapters.
         """
         try:
             self._text_generation_queues[command_id], recv = channel[
-                TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
+                TokenChunk
+                | ErrorChunk
+                | ToolCallChunk
+                | ToolCallDeltaChunk
+                | PrefillProgressChunk
             ]()
 
             with recv as token_chunks:
@@ -928,7 +955,7 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._chunk_stream_with_tool_call_deltas(command.command_id),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -971,7 +998,7 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._chunk_stream_with_tool_call_deltas(command.command_id),
                     ),
                 ),
                 media_type="text/event-stream",

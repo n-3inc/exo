@@ -20,6 +20,8 @@ from exo.api.types import (
     LogprobsContentItem,
     StreamingChoiceResponse,
     ToolCall,
+    ToolCallDelta,
+    ToolCallFunctionDelta,
     Usage,
 )
 from exo.download.download_utils import create_http_session
@@ -28,6 +30,7 @@ from exo.shared.types.chunks import (
     PrefillProgressChunk,
     TokenChunk,
     ToolCallChunk,
+    ToolCallDeltaChunk,
 )
 from exo.shared.types.common import CommandId
 from exo.shared.types.text_generation import (
@@ -215,14 +218,44 @@ def chunk_to_response(
     )
 
 
+def _tool_call_delta_response(
+    command_id: CommandId,
+    model: str,
+    deltas: list[ToolCallDelta],
+    finish_reason: FinishReason | None = None,
+    usage: Usage | None = None,
+) -> str:
+    response = ChatCompletionResponse(
+        id=command_id,
+        created=int(time.time()),
+        model=model,
+        choices=[
+            StreamingChoiceResponse(
+                index=0,
+                delta=ChatCompletionMessage(role="assistant", tool_calls=deltas),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=usage,
+    )
+    return f"data: {response.model_dump_json(exclude_none=True)}\n\n"
+
+
 async def generate_chat_stream(
     command_id: CommandId,
     chunk_stream: AsyncGenerator[
-        PrefillProgressChunk | ErrorChunk | ToolCallChunk | TokenChunk, None
+        PrefillProgressChunk
+        | ErrorChunk
+        | ToolCallChunk
+        | ToolCallDeltaChunk
+        | TokenChunk,
+        None,
     ],
 ) -> AsyncGenerator[str, None]:
     """Generate Chat Completions API streaming events from chunks."""
     last_usage: Usage | None = None
+    # Arguments already sent for each tool call streamed while generated.
+    streamed_arguments: dict[int, str] = {}
 
     async for chunk in chunk_stream:
         match chunk:
@@ -242,34 +275,85 @@ async def generate_chat_stream(
                 yield "data: [DONE]\n\n"
                 return
 
+            case ToolCallDeltaChunk():
+                streamed_arguments[chunk.index] = (
+                    streamed_arguments.get(chunk.index, "") + chunk.arguments
+                )
+                is_first = chunk.name is not None
+                yield _tool_call_delta_response(
+                    command_id,
+                    chunk.model,
+                    [
+                        ToolCallDelta(
+                            index=chunk.index,
+                            id=chunk.id if is_first else None,
+                            type="function" if is_first else None,
+                            function=ToolCallFunctionDelta(
+                                name=chunk.name, arguments=chunk.arguments
+                            ),
+                        )
+                    ],
+                )
+
             case ToolCallChunk():
                 last_usage = chunk.usage or last_usage
 
-                tool_call_deltas = [
-                    ToolCall(
-                        id=tool.id,
-                        index=i,
-                        function=tool,
+                if not streamed_arguments:
+                    tool_response = ChatCompletionResponse(
+                        id=command_id,
+                        created=int(time.time()),
+                        model=chunk.model,
+                        choices=[
+                            StreamingChoiceResponse(
+                                index=0,
+                                delta=ChatCompletionMessage(
+                                    role="assistant",
+                                    tool_calls=[
+                                        ToolCall(id=tool.id, index=i, function=tool)
+                                        for i, tool in enumerate(chunk.tool_calls)
+                                    ],
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                        usage=last_usage,
                     )
-                    for i, tool in enumerate(chunk.tool_calls)
-                ]
-                tool_response = ChatCompletionResponse(
-                    id=command_id,
-                    created=int(time.time()),
-                    model=chunk.model,
-                    choices=[
-                        StreamingChoiceResponse(
-                            index=0,
-                            delta=ChatCompletionMessage(
-                                role="assistant",
-                                tool_calls=tool_call_deltas,
-                            ),
-                            finish_reason="tool_calls",
-                        )
-                    ],
-                    usage=last_usage,
-                )
-                yield f"data: {tool_response.model_dump_json(exclude_none=True)}\n\n"
+                    yield f"data: {tool_response.model_dump_json(exclude_none=True)}\n\n"
+                else:
+                    # Send what the pieces have not: the end of each streamed
+                    # call's arguments, and any call that was not streamed.
+                    rest: list[ToolCallDelta] = []
+                    for i, tool in enumerate(chunk.tool_calls):
+                        sent = streamed_arguments.get(i)
+                        if sent is None:
+                            rest.append(
+                                ToolCallDelta(
+                                    index=i,
+                                    id=tool.id,
+                                    type="function",
+                                    function=ToolCallFunctionDelta(
+                                        name=tool.name, arguments=tool.arguments
+                                    ),
+                                )
+                            )
+                        elif len(tool.arguments) > len(
+                            sent
+                        ) and tool.arguments.startswith(sent):
+                            rest.append(
+                                ToolCallDelta(
+                                    index=i,
+                                    function=ToolCallFunctionDelta(
+                                        arguments=tool.arguments[len(sent) :]
+                                    ),
+                                )
+                            )
+                    yield _tool_call_delta_response(
+                        command_id,
+                        chunk.model,
+                        rest,
+                        finish_reason="tool_calls",
+                        usage=last_usage,
+                    )
                 if chunk.stats is not None:
                     yield f": generation_stats {chunk.stats.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"

@@ -20,15 +20,21 @@ from exo.shared.types.chunks import (
     GenerationChunk,
     TokenChunk,
     ToolCallChunk,
+    ToolCallDeltaChunk,
 )
 from exo.shared.types.common import ModelId
-from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
+from exo.shared.types.worker.runner_response import (
+    GenerationResponse,
+    ToolCallDeltaResponse,
+    ToolCallResponse,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     detect_thinking_prompt_suffix,
 )
 from exo.worker.engines.mlx.vendor.dsml_encoding import parse_dsml_output
 from exo.worker.runner.bootstrap import logger
+from exo.worker.runner.llm_inference.dsml_tool_call_stream import DsmlToolCallStream
 from exo.worker.runner.llm_inference.tool_parsers import ToolParser
 
 
@@ -39,8 +45,10 @@ def get_gpt_oss_encoding():
 
 
 def count_reasoning_tokens(
-    responses: Generator[GenerationResponse | ToolCallResponse | None],
-) -> Generator[GenerationResponse | ToolCallResponse | None]:
+    responses: Generator[
+        GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None
+    ],
+) -> Generator[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None]:
     """Count tokens with is_thinking=True and patch the total into Usage on the final response."""
     reasoning_tokens = 0
     for response in responses:
@@ -49,7 +57,11 @@ def count_reasoning_tokens(
             continue
         if isinstance(response, GenerationResponse) and response.is_thinking:
             reasoning_tokens += 1
-        if response.usage is not None and reasoning_tokens > 0:
+        if (
+            not isinstance(response, ToolCallDeltaResponse)
+            and response.usage is not None
+            and reasoning_tokens > 0
+        ):
             response = response.model_copy(
                 update={
                     "usage": response.usage.model_copy(
@@ -73,7 +85,9 @@ def apply_all_parsers(
     model_id: ModelId,
     tools: list[dict[str, Any]] | None,
 ) -> Iterator[GenerationChunk | None]:
-    generator = receiver
+    generator: Generator[
+        GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None
+    ] = receiver
 
     normalized_id = model_id.normalize().lower()
     if issubclass(model_type, GptOssModel):
@@ -114,7 +128,8 @@ def apply_all_parsers(
 
 
 def map_responses_to_chunks(
-    response: GenerationResponse | ToolCallResponse | None, model_id: ModelId
+    response: GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None,
+    model_id: ModelId,
 ) -> GenerationChunk | None:
     match response:
         case None:
@@ -149,6 +164,14 @@ def map_responses_to_chunks(
                 model=model_id,
                 usage=response.usage,
                 stats=response.stats,
+            )
+        case ToolCallDeltaResponse():
+            return ToolCallDeltaChunk(
+                model=model_id,
+                index=response.index,
+                id=response.id,
+                name=response.name,
+                arguments=response.arguments,
             )
 
 
@@ -221,7 +244,7 @@ def parse_gpt_oss(
 
 def parse_deepseek_v32(
     responses: Generator[GenerationResponse | None],
-) -> Generator[GenerationResponse | ToolCallResponse | None]:
+) -> Generator[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None]:
     """Parse DeepSeek V3.2 DSML tool calls from the generation stream.
 
     Uses accumulated-text matching (not per-token marker checks) because
@@ -242,7 +265,7 @@ def parse_deepseek_v32(
 
 def parse_deepseek_v4(
     responses: Generator[GenerationResponse | None],
-) -> Generator[GenerationResponse | ToolCallResponse | None]:
+) -> Generator[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None]:
     dsml_token = "｜DSML｜"
     start = f"<{dsml_token}tool_calls>"
     end = f"</{dsml_token}tool_calls>"
@@ -254,19 +277,40 @@ def _parse_dsml_stream(
     tool_calls_start: str,
     tool_calls_end: str,
     parse_body: Callable[[str], list[ToolCallItem] | None],
-) -> Generator[GenerationResponse | ToolCallResponse | None]:
+) -> Generator[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None]:
     accumulated = ""
     in_tool_call = False
     # Tokens buffered while we detect the start of a DSML block
     pending_buffer: list[GenerationResponse] = []
     # Text accumulated during a tool call block
     tool_call_text = ""
+    stream = DsmlToolCallStream()
+
+    def _deltas(text: str) -> list[ToolCallDeltaResponse]:
+        return [
+            ToolCallDeltaResponse(
+                index=index,
+                id=call.id,
+                name=call.name if is_new else None,
+                arguments=added,
+            )
+            for index, call, is_new, added in stream.update(text)
+        ]
 
     def _try_parse_tool_call(
         text: str, response: GenerationResponse
     ) -> ToolCallResponse | GenerationResponse:
+        nonlocal stream
         parsed = parse_body(text)
+        streamed, stream = stream.calls, DsmlToolCallStream()
         if parsed is not None:
+            # Keep the ids the streamed pieces were sent under.
+            for item, call in zip(parsed, streamed, strict=False):
+                item.id = call.id
+                if not item.arguments.startswith(call.arguments):
+                    logger.warning(
+                        f"Streamed tool call {call.name} differs from the parsed one"
+                    )
             return ToolCallResponse(
                 tool_calls=parsed, usage=response.usage, stats=response.stats
             )
@@ -304,6 +348,8 @@ def _parse_dsml_stream(
                 yield _try_parse_tool_call(tool_call_text, response)
                 in_tool_call = False
                 tool_call_text = ""
+            else:
+                yield from _deltas(tool_call_text)
             continue
 
         accumulated += response.text
@@ -332,6 +378,7 @@ def _parse_dsml_stream(
                 tool_call_text = ""
             else:
                 in_tool_call = True
+                yield from _deltas(tool_call_text)
             continue
 
         if _could_be_marker_prefix(accumulated, tool_calls_start):

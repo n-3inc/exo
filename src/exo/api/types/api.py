@@ -82,6 +82,21 @@ class ToolCall(BaseModel):
     function: ToolCallItem
 
 
+class ToolCallFunctionDelta(BaseModel):
+    name: str | None = None
+    arguments: str
+
+
+class ToolCallDelta(BaseModel):
+    """A streamed piece of a tool call: the first carries its id and name,
+    every one a piece of its JSON arguments."""
+
+    index: int
+    id: str | None = None
+    type: Literal["function"] | None = None
+    function: ToolCallFunctionDelta
+
+
 class ChatCompletionMessage(BaseModel):
     role: Literal["system", "user", "assistant", "developer", "tool", "function"]
     content: (
@@ -89,7 +104,7 @@ class ChatCompletionMessage(BaseModel):
     ) = None
     reasoning_content: str | None = None
     name: str | None = None
-    tool_calls: list[ToolCall] | None = None
+    tool_calls: list[ToolCall] | list[ToolCallDelta] | None = None
     tool_call_id: str | None = None
     function_call: dict[str, Any] | None = None
 

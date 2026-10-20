@@ -6,6 +6,7 @@ from exo.api.types import CompletionTokensDetails, PromptTokensDetails, Usage
 from exo.shared.types.worker.runner_response import (
     FinishReason,
     GenerationResponse,
+    ToolCallDeltaResponse,
     ToolCallResponse,
 )
 from exo.worker.engines.mlx.vendor.dsml_encoding import (
@@ -43,10 +44,12 @@ def _queue_source(
 
 
 def _step_until_finish(
-    parser_gen: Generator[GenerationResponse | ToolCallResponse | None],
+    parser_gen: Generator[
+        GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None
+    ],
     max_steps: int = 200,
-) -> list[GenerationResponse | ToolCallResponse]:
-    results: list[GenerationResponse | ToolCallResponse] = []
+) -> list[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse]:
+    results: list[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse] = []
     for _ in range(max_steps):
         try:
             result = next(parser_gen)
@@ -62,11 +65,13 @@ def _step_until_finish(
     return results
 
 
-def _got_finish(results: list[GenerationResponse | ToolCallResponse]) -> bool:
+def _got_finish(
+    results: list[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse],
+) -> bool:
     for r in results:
         if isinstance(r, ToolCallResponse):
             return True
-        if r.finish_reason is not None:
+        if isinstance(r, GenerationResponse) and r.finish_reason is not None:
             return True
     return False
 
@@ -497,7 +502,9 @@ class TestBatchGeneratorSingleNext:
             _make_response("", 2, finish_reason="stop"),
         ]
 
-        collected: list[GenerationResponse | ToolCallResponse] = []
+        collected: list[
+            GenerationResponse | ToolCallResponse | ToolCallDeltaResponse
+        ] = []
         for token in tokens:
             queue.push(token)
             while (parsed := next(parser, None)) is not None:
@@ -514,7 +521,7 @@ class TestBatchGeneratorSingleNext:
 
 
 def _drain_text(
-    results: list[GenerationResponse | ToolCallResponse],
+    results: list[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse],
 ) -> str:
     return "".join(
         r.text

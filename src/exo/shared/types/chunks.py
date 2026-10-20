@@ -47,6 +47,17 @@ class ToolCallChunk(BaseChunk):
     stats: GenerationStats | None = None
 
 
+class ToolCallDeltaChunk(BaseChunk):
+    """A piece of tool call ``index`` while it is being generated; the
+    ToolCallChunk at the end still carries every complete tool call."""
+
+    index: int
+    id: str
+    name: str | None
+    arguments: str
+    finish_reason: None = None
+
+
 class ImageChunk(BaseChunk):
     data: str
     chunk_index: int
@@ -91,5 +102,7 @@ class PrefillProgressChunk(BaseChunk):
 
 
 StatusChunk = PrefillProgressChunk
-GenerationChunk = TokenChunk | ImageChunk | ToolCallChunk | ErrorChunk
+GenerationChunk = (
+    TokenChunk | ImageChunk | ToolCallChunk | ToolCallDeltaChunk | ErrorChunk
+)
 Chunk = StatusChunk | GenerationChunk

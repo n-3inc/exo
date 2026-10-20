@@ -5,6 +5,7 @@ from typing import Any, cast
 from exo.shared.types.common import ModelId
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
+    ToolCallDeltaResponse,
     ToolCallResponse,
 )
 from exo.worker.engines.mlx.vendor.dsml_encoding import (
@@ -30,7 +31,7 @@ from exo.worker.runner.llm_inference.model_output_parsers import (
 def _parse_deepseek_with_thinking(
     source: Generator[GenerationResponse | None],
     starts_in_thinking: bool = False,
-) -> Generator[GenerationResponse | ToolCallResponse | None]:
+) -> Generator[GenerationResponse | ToolCallResponse | ToolCallDeltaResponse | None]:
     return parse_deepseek_v32(
         parse_thinking_models(
             source,

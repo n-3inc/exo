@@ -62,6 +62,13 @@ class ToolCallResponse(BaseRunnerResponse):
     stats: GenerationStats | None = None
 
 
+class ToolCallDeltaResponse(BaseRunnerResponse):
+    index: int
+    id: str
+    name: str | None
+    arguments: str
+
+
 class FinishedResponse(BaseRunnerResponse):
     pass
 

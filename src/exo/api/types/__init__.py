@@ -52,6 +52,8 @@ from .api import StartDownloadParams as StartDownloadParams
 from .api import StartDownloadResponse as StartDownloadResponse
 from .api import StreamingChoiceResponse as StreamingChoiceResponse
 from .api import ToolCall as ToolCall
+from .api import ToolCallDelta as ToolCallDelta
+from .api import ToolCallFunctionDelta as ToolCallFunctionDelta
 from .api import ToolCallItem as ToolCallItem
 from .api import TopLogprobItem as TopLogprobItem
 from .api import TraceCategoryStats as TraceCategoryStats
